@@ -46,7 +46,24 @@ jobs:
       - name: Check public source inventory
         run: python tools/check_repository.py
       - name: Host regression tests
-        run: python -m unittest discover -s tests -v
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          import unittest
+
+          class DiagnosticResult(unittest.TextTestResult):
+              def addError(self, test, error):
+                  failure = error[1]
+                  if isinstance(failure, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+                      for output in (failure.stdout, failure.stderr):
+                          if output:
+                              print(output, file=sys.stderr)
+                  super().addError(test, error)
+
+          suite = unittest.defaultTestLoader.discover('tests')
+          result = unittest.TextTestRunner(verbosity=2, resultclass=DiagnosticResult).run(suite)
+          sys.exit(0 if result.wasSuccessful() else 1)
       - name: Python syntax
         run: python -m compileall -q tools tests
       - name: Firmware verification availability
