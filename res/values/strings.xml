@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">音效</string>
+    <string name="module_description">三星杜比档位与增强控制。仅扩展三星音效页面，Root 后台保留手动选择。</string>
+</resources>

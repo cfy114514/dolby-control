@@ -1,0 +1,23 @@
+# Local signing identity and all credentials stay on this computer.
+/private/
+*.p12
+*.jks
+*.keystore
+*.pem
+.env
+.env.*
+
+# Reproducible build products, downloaded compile-only API and device evidence.
+/build/
+/dist/
+/vendor/*.jar
+/assets/backend/table-runtime
+/src/io/github/dcl/app/BuildIdentity.java
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
