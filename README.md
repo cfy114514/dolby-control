@@ -7,7 +7,7 @@
 ## 功能
 
 - 系统页面切档，手选 Music 或 Spatial Audio 后，暂停、继续、切歌和页面重开保持选择。手选“自动”解除保持。
-- 首页只有“关闭增强 / 三星预设”和声音调节入口。关闭增强保留空间渲染及数值设置；三星预设恢复全部原厂参数。
+- 首页只有“关闭增强 / 三星预设”和声音调节入口。关闭增强保留空间渲染及数值设置；三星预设恢复 44 项可调参数的原厂值。
 - 当前档位独立调节增强开关与强度；共用参数明确标注。调整先暂存，再一次批量应用。Spatial Audio 保留自己的渲染参数。
 - Root 后台独立保存和恢复设置；不修改系统文件，不主动开启已关闭的杜比。
 
@@ -17,7 +17,7 @@ Music 与 Spatial Audio 都使用现有空间处理器。原厂 Music 开启智�
 
 目前只支持已核对的 **SM-S9110 / Android 16 / SoundAlive 16.1.32** 固件。适配器按固件指纹、SYSTEM 库哈希、进程身份、记录前缀及数值范围校验；其他固件会拒绝写入。具体版本和 44 个可写槽位见 [`table_spec.h`](src/native/table_spec.h)。不能仅去掉校验来支持其他机型。
 
-安装自行签名的 APK，在 KernelSU 中给“音效”授予 Root，并在兼容现代 API 101 的 LSPosed 中启用模块，作用域只选 `com.sec.android.app.soundalive`。重新打开三星杜比页面，让新钩子载入。后台设置保存在 `/data/adb/dolby_control_app/`，与旧模块目录独立。
+安装自行签名的 APK，在 KernelSU 中给“音效”授予 Root，并在兼容现代 API 101 的 LSPosed 中启用模块，作用域只选 `com.sec.android.app.soundalive`。首次启用或更新后，强行停止三星 SoundAlive，再打开系统杜比页面，让新钩子载入；只退出并重开页面不一定结束旧进程。后台设置保存在 `/data/adb/dolby_control_app/`，与旧模块目录独立。
 
 ## 构建
 
