@@ -46,6 +46,12 @@ jobs:
       - name: Check public source inventory
         run: python tools/check_repository.py
       - name: Host regression tests
+        # Windows' default TEMP may use an 8.3 alias, which the production lock
+        # correctly rejects. Exercise valid locks from the canonical runner dir.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         shell: python
         run: |
           import subprocess
