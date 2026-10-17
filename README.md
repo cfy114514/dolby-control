@@ -50,7 +50,7 @@ python tools/build.py --init-signing
 python tools/verify_table_spec.py --library /path/to/original-libspatializerparamstorage.so --require-library
 ```
 
-缺少原厂库时会明确显示 `SKIP`，不会算作已验证。0.6.1 曾在 S23、AirPods 与 Apple Music Dolby Atmos 播放中验证；本轮改动的结果和限制见 [`docs/REVIEW.md`](docs/REVIEW.md)。
+缺少原厂库时会明确显示 `SKIP`，不会算作已验证。0.6.2 已在 S23 验证切档保持、Spatial 参数的 DSP 变化、草稿重建/跨档清除及覆盖更新后恢复 44 项设置。AirPods 与 Apple Music Dolby Atmos 的专门验收来自 0.6.1；本轮未重新确认这两项，具体结果和限制见 [`docs/REVIEW.md`](docs/REVIEW.md)。
 
 源码结构：`src/io/github/dcl/` 为独立后台及音效适配；`src/io/github/dcl/app/` 为原生界面、Root 客户端与 SoundAlive 钩子；`src/native/` 为固定表事务；`tests/` 为宿主回归；`tools/` 为构建和开发验收工具。
 
