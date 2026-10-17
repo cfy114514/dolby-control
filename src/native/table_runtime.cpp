@@ -26,7 +26,13 @@ constexpr const char* kCmdline = "/system/bin/audioserver";
 constexpr unsigned kCount = sizeof(dcl_spec::kRecords) / sizeof(dcl_spec::kRecords[0]);
 static_assert(kCount > 0 && kCount <= dcl_txn::kMaximumWords, "Invalid table size");
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "Table words require little endian");
-struct Fd { int value = -1; ~Fd() { if (value >= 0) close(value); } };
+struct Fd {
+  int value = -1;
+  Fd() = default;
+  Fd(const Fd&) = delete;
+  Fd& operator=(const Fd&) = delete;
+  ~Fd() { if (value >= 0) close(value); }
+};
 std::string quote(const std::string& value) {
   std::string result = "\"";
   for (unsigned char c : value) {
@@ -37,18 +43,21 @@ std::string quote(const std::string& value) {
   return result + '"';
 }
 [[noreturn]] void fail(const std::string& message) { throw std::runtime_error(message); }
-std::string read_file(const std::string& path, size_t maximum = 1024 * 1024) {
-  Fd fd; fd.value = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd.value < 0) fail("Cannot read " + path + ": " + strerror(errno));
+std::string read_descriptor(int fd, const std::string& path, size_t maximum) {
   std::string data;
   std::array<char, 4096> buffer{};
   for (;;) {
-    ssize_t n = read(fd.value, buffer.data(), buffer.size());
+    ssize_t n = read(fd, buffer.data(), buffer.size());
     if (n < 0) { if (errno == EINTR) continue; fail("Read failed: " + path); }
     if (!n) return data;
     if (data.size() + static_cast<size_t>(n) > maximum) fail("Oversize input: " + path);
     data.append(buffer.data(), static_cast<size_t>(n));
   }
+}
+std::string read_file(const std::string& path, size_t maximum = 1024 * 1024) {
+  Fd fd; fd.value = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd.value < 0) fail("Cannot read " + path + ": " + strerror(errno));
+  return read_descriptor(fd.value, path, maximum);
 }
 std::string trim(std::string value) {
   while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
@@ -163,6 +172,7 @@ uint64_t address_for(const std::vector<Mapping>& maps, const struct stat& file, 
   uint64_t address = 0;
   unsigned matches = 0;
   for (const auto& map : maps) {
+    if (map.end <= map.begin) fail("Invalid SYSTEM library mapping range");
     if (offset < map.offset || size > map.end - map.begin || offset - map.offset > map.end - map.begin - size) continue;
     if (map.permissions != "r--p") fail("Allowlisted data is not in a private read-only non-executable mapping");
     if (map.inode != static_cast<uint64_t>(file.st_ino) || map.device_major != major(file.st_dev) || map.device_minor != minor(file.st_dev))
@@ -204,7 +214,7 @@ int write_callback(void* opaque, dcl_txn::U64 address, dcl_txn::U32 value) {
   do { result = pwrite(fd, &value, sizeof value, static_cast<off_t>(address)); } while (result < 0 && errno == EINTR);
   return result == sizeof value;
 }
-void acquire_lock(Fd& lock) {
+void acquire_lock(Fd& lock, bool exclusive) {
   struct stat info{};
   if (lstat(kBase, &info) < 0) {
     if (errno != ENOENT || mkdir(kBase, 0700) < 0) fail("Cannot create private module state directory");
@@ -215,7 +225,8 @@ void acquire_lock(Fd& lock) {
   lock.value = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (lock.value < 0 || fstat(lock.value, &info) < 0 || !S_ISREG(info.st_mode) || info.st_uid != 0 || info.st_nlink != 1 || (info.st_mode & 0077))
     fail("Unsafe transaction lock file");
-  if (flock(lock.value, LOCK_EX | LOCK_NB) < 0) fail("Another table transaction is active");
+  if (flock(lock.value, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) < 0)
+    fail("Another table transaction is active");
 }
 const char* state_name(int state) {
   return state == dcl_txn::Original ? "original" : state == dcl_txn::Target ? "target" :
@@ -285,26 +296,31 @@ int main(int argc, char** argv) {
   std::vector<dcl_edits::Field> fields;
   dcl_txn::U32 before_values[kCount]{}, after_values[kCount]{};
   try {
+    fields.reserve(kCount);
     for (unsigned i = 0; i < kCount; ++i) {
       const auto& record = dcl_spec::kRecords[i];
       verify_edit_identity(i, record);
       fields.push_back({record.profile, record.key, record.minimum, record.maximum});
     }
-    if (command == "set") {
+    if (command == "set" || command == "restore") {
       const int parsed = dcl_edits::parse(argc, argv, fields.data(), static_cast<unsigned>(fields.size()), selection);
       if (parsed) fail("Invalid fixed field batch: " + std::to_string(parsed));
     } else if ((command != "status" && command != "on" && command != "off") || argc != 2)
-      fail("Usage: table-runtime status|on|off OR set PROFILE KEY VALUE [PROFILE KEY VALUE ...]");
+      fail("Usage: table-runtime status|on|off OR set PROFILE KEY VALUE [...] OR restore PROFILE KEY EXPECTED_CURRENT RESTORE_VALUE [...]");
     if (!dcl_spec::kReady || getuid() != 0) fail("Root and a completed exact firmware allowlist are required");
     if (fingerprint() != dcl_spec::kFingerprint) fail("Firmware fingerprint mismatch");
     Fd lock;
-    if (command != "status") acquire_lock(lock);
-    const std::string library = read_file(dcl_spec::kLibraryPath, 1024 * 1024);
+    // Readers share the writer lock to avoid publishing a partial helper batch.
+    acquire_lock(lock, command != "status");
+    Fd library_file;
+    library_file.value = open(dcl_spec::kLibraryPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat library_stat{};
+    if (library_file.value < 0 || fstat(library_file.value, &library_stat) < 0 || !S_ISREG(library_stat.st_mode))
+      fail("Cannot open verified SYSTEM library");
+    const std::string library = read_descriptor(library_file.value, dcl_spec::kLibraryPath, 1024 * 1024);
     if (library.size() != dcl_spec::kLibrarySize) fail("SYSTEM library size mismatch");
     hash = sha256(library);
     if (hash != dcl_spec::kLibrarySha256) fail("SYSTEM library SHA-256 mismatch");
-    struct stat library_stat{};
-    if (stat(dcl_spec::kLibraryPath, &library_stat) < 0 || !S_ISREG(library_stat.st_mode)) fail("Cannot stat verified SYSTEM library");
     identity = find_process();
     if (const char* expected = getenv("DCL_EXPECT_PROCESS")) {
       const std::string actual = std::to_string(identity.pid) + ":" + identity.starttime + ":" + identity.boot;
@@ -318,9 +334,10 @@ int main(int argc, char** argv) {
     if (memory.value < 0) fail("Cannot open audioserver memory: " + std::string(strerror(errno)));
     context.memory = memory.value;
     std::vector<dcl_txn::Word> words;
+    words.reserve(kCount);
     for (const auto& record : dcl_spec::kRecords) {
-      verify_edit_identity(static_cast<unsigned>(words.size()), record);
-      if (record.file_offset < 12 || record.file_offset % 4 || record.file_offset + 4 > library.size()) fail("Invalid fixed record offset");
+      if (record.file_offset < 12 || record.file_offset % 4 || library.size() < 4 || record.file_offset > library.size() - 4)
+        fail("Invalid fixed record offset");
       const uint64_t address = address_for(maps, library_stat, record.file_offset - 12, 16);
       uint32_t expected[4]{0x40000000U, record.parameter_id, 1U, static_cast<uint32_t>(record.original)};
       if (memcmp(library.data() + record.file_offset - 12, expected, 16) != 0) fail("Allowlist does not match immutable ELF record");
@@ -336,7 +353,8 @@ int main(int argc, char** argv) {
     attempted = true;
     result = dcl_txn::run(words.data(), static_cast<unsigned>(words.size()),
                          command == "status" ? 0 : command == "on" ? 1 : command == "off" ? 2 : 3,
-                         callbacks, selection.values, selection.selected, before_values, after_values);
+                         callbacks, selection.values, selection.selected, before_values, after_values,
+                         command == "restore" ? selection.expected : nullptr);
     if (result.code) error = code_name(result.code);
   } catch (const std::exception& exception) { error = exception.what(); }
   const bool ok = error.empty();

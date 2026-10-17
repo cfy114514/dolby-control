@@ -9,3 +9,6 @@ indent_size = 4
 
 [*.{json,yml,yaml,xml}]
 indent_size = 2
+
+[*.{h,cpp}]
+indent_size = 2

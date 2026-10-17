@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
   if (root.rfind(prefix, 0) != 0 || root.size() != strlen(prefix) + 32 ||
       root.find_first_not_of("0123456789abcdef", strlen(prefix)) != std::string::npos) return 2;
   struct stat directory{};
-  if (lstat(root.c_str(), &directory) || !S_ISDIR(directory.st_mode) || (directory.st_mode & 0077)) return 2;
+  if (lstat(root.c_str(), &directory) || !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid() ||
+      (directory.st_mode & 0077)) return 2;
   std::string path = root + "/cow-data.XXXXXX";
   int file = mkstemp(path.data());
   if (file < 0) return 3;

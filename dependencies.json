@@ -1,0 +1,8 @@
+{
+  "libxposed_api": {
+    "version": "101.0.1",
+    "url": "https://repo.maven.apache.org/maven2/io/github/libxposed/api/101.0.1/api-101.0.1.aar",
+    "aar_sha256": "31ef4bd9d8e783354c0706ec29e5bd421011e73d20dbb01e08e9cf2658ba6047",
+    "jar_sha256": "2421b40ad9a0015731a1399fd547c7132ad73491a6b6864ce9c9f3d1bbf0a120"
+  }
+}

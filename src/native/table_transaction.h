@@ -43,16 +43,30 @@ inline State classify(const Word* words, const U32* values, unsigned count) {
   }
   return original ? Original : target ? Target : custom ? Custom : Mixed;
 }
+inline bool possible_short_write(U32 before, U32 desired, U32 observed) {
+  // pwrite can stop after a prefix of the native byte representation. Do not
+  // mistake an unrelated later value for a partially completed write.
+  U32 candidate = before;
+  auto* bytes = reinterpret_cast<unsigned char*>(&candidate);
+  const auto* wanted = reinterpret_cast<const unsigned char*>(&desired);
+  for (unsigned i = 0; i < sizeof(U32); ++i) {
+    bytes[i] = wanted[i];
+    if (candidate == observed) return true;
+  }
+  return false;
+}
 inline Result run(const Word* words, unsigned count, int mode, const Callbacks& cb,
                   const U32* requested = nullptr, const unsigned* selected = nullptr,
-                  U32* before_output = nullptr, U32* after_output = nullptr) {
+                  U32* before_output = nullptr, U32* after_output = nullptr,
+                  const U32* expected = nullptr) {
   Result result{};
   result.rollback_complete = 1;
   if (!words || !count || count > kMaximumWords || mode < 0 || mode > 3 ||
       (mode == 3 && (!requested || !selected)) ||
       !cb.identity || !cb.read || !cb.write) { result.code = BadInput; return result; }
   if (mode == 3) {
-    for (unsigned i = 0; i < count; ++i) if (selected[i] && !allowed(words[i], requested[i])) {
+    for (unsigned i = 0; i < count; ++i) if (selected[i] &&
+        (!allowed(words[i], requested[i]) || (expected && !allowed(words[i], expected[i])))) {
       result.code = BadInput; result.failed_index = i; return result;
     }
   }
@@ -63,6 +77,11 @@ inline Result run(const Word* words, unsigned count, int mode, const Callbacks& 
     if (!cb.read(cb.context, words[i].address, &before[i])) { result.code = ReadFailed; return result; }
     if (!allowed(words[i], before[i])) {
       result.code = UnexpectedWord; return result;
+    }
+    // Conditional recovery compares every selected word before the first
+    // mutation. Never restore a stale snapshot over a known later writer.
+    if (mode == 3 && expected && selected[i] && before[i] != expected[i]) {
+      result.code = ConcurrentChange; return result;
     }
     for (unsigned j = 0; j < i; ++j) if (words[i].address == words[j].address) {
       result.code = BadInput; return result;
@@ -79,6 +98,7 @@ inline Result run(const Word* words, unsigned count, int mode, const Callbacks& 
   for (unsigned i = 0; i < count; ++i) desired_values[i] = mode == 1 ? (words[i].is_flag ? words[i].target : before[i]) :
       mode == 2 ? words[i].original : selected[i] ? requested[i] : before[i];
   unsigned touched[kMaximumWords], touched_count = 0;
+  bool uncertain_write[kMaximumWords];
   for (unsigned i = 0; i < count; ++i) {
     const U32 desired = desired_values[i];
     if (before[i] == desired) continue;
@@ -89,7 +109,11 @@ inline Result run(const Word* words, unsigned count, int mode, const Callbacks& 
     if (observed != before[i]) { result.code = ConcurrentChange; break; }
     // Include a failed write in rollback: a short pwrite can still modify bytes.
     touched[touched_count++] = i;
-    if (!cb.write(cb.context, words[i].address, desired)) { result.code = WriteFailed; break; }
+    uncertain_write[i] = false;
+    if (!cb.write(cb.context, words[i].address, desired)) {
+      uncertain_write[i] = true;
+      result.code = WriteFailed; break;
+    }
     ++result.changed_words;
     if (!cb.identity(cb.context)) { result.code = IdentityChanged; break; }
     if (!cb.read(cb.context, words[i].address, &observed) || observed != desired) {
@@ -118,8 +142,21 @@ inline Result run(const Word* words, unsigned count, int mode, const Callbacks& 
   for (unsigned position = touched_count; position > 0; --position) {
     const unsigned i = touched[position - 1];
     if (!cb.identity(cb.context)) { result.rollback_complete = 0; continue; }
-    if (!cb.write(cb.context, words[i].address, before[i])) { result.rollback_complete = 0; continue; }
     U32 observed = 0;
+    if (!cb.read(cb.context, words[i].address, &observed)) { result.rollback_complete = 0; continue; }
+    if (observed == before[i]) continue;
+    // A completed write can only be safely undone while its value is still
+    // present. Preserve a later writer's different value and report an
+    // incomplete rollback. For a failed/short write, only restore a value that
+    // could be its prefix write. A concurrent value equal to that prefix is
+    // indistinguishable; this remains best-effort rollback, not isolation from
+    // arbitrary external writers.
+    if (observed != desired_values[i] &&
+        (!uncertain_write[i] || !possible_short_write(before[i], desired_values[i], observed))) {
+      result.rollback_complete = 0; continue;
+    }
+    if (!cb.identity(cb.context)) { result.rollback_complete = 0; continue; }
+    if (!cb.write(cb.context, words[i].address, before[i])) { result.rollback_complete = 0; continue; }
     if (!cb.identity(cb.context) || !cb.read(cb.context, words[i].address, &observed) || observed != before[i]) {
       result.rollback_complete = 0; continue;
     }

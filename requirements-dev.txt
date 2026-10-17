@@ -1,0 +1,2 @@
+# Optional formatting/lint tool. Building and running tests need only stdlib.
+ruff==0.17.1

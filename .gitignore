@@ -11,9 +11,12 @@
 /build/
 /dist/
 /vendor/*.jar
+/vendor/*.tmp
 /assets/backend/table-runtime
 /src/io/github/dcl/app/BuildIdentity.java
 __pycache__/
+.ruff_cache/
+.pytest_cache/
 *.py[cod]
 
 # Editor and operating-system files.

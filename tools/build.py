@@ -1,67 +1,267 @@
-"""Reproducible SDK-only build; no Gradle/plugin downloads or system configuration writes."""
+#!/usr/bin/env python3
+"""Build from pinned inputs. Downloads and installation are separate commands."""
+
+import argparse
+import hashlib
+import json
+import os
 from pathlib import Path
-import hashlib, json, os, secrets, shutil, subprocess, zipfile
+import secrets
+import shutil
+import subprocess
+import sys
+import zipfile
 
-ROOT = Path(__file__).resolve().parents[1]
-SDK = Path(os.environ.get('DCL_ANDROID_SDK', r'C:\Users\123\AppData\Local\Android\Sdk'))
-JDK = Path(os.environ.get('DCL_JAVA', r'C:\Program Files\Android\Android Studio\jbr'))
-BT = SDK / 'build-tools/36.0.0'
-ANDROID = SDK / 'platforms/android-37.0/android.jar'
-BUILD = ROOT / 'build'
-BUILD.mkdir(exist_ok=True)
-VERSION_NAME = '0.6.1'
-VERSION_CODE = 601
+from build_config import CONFIG, DEPENDENCIES, ROOT, executable, java_home, run, sdk_root, sha256
 
-def run(args):
-    result = subprocess.run([str(x) for x in args], capture_output=True, text=True, encoding='utf-8', errors='replace')
-    if result.returncode:
-        print(result.stdout)
-        print(result.stderr)
-        raise SystemExit(result.returncode)
-    if result.stderr.strip(): print(result.stderr.strip()[:3000])
-    return result.stdout
 
-native_hash = hashlib.sha256((ROOT/'assets/backend/table-runtime').read_bytes()).hexdigest()
-token_hash = hashlib.sha256()
-for p in sorted((ROOT/'src').rglob('*.java')):
-    if p.name != 'BuildIdentity.java': token_hash.update(p.relative_to(ROOT).as_posix().encode()+p.read_bytes())
-token_hash.update(native_hash.encode())
-token = token_hash.hexdigest()[:24]
-(ROOT/'src/io/github/dcl/app/BuildIdentity.java').write_text(
-    f'package io.github.dcl.app;\npublic final class BuildIdentity {{ public static final String TOKEN="{token}"; public static final String NATIVE_SHA256="{native_hash}"; }}\n', encoding='utf-8')
-classes=BUILD/'classes'
-if classes.exists(): shutil.rmtree(classes)
-classes.mkdir()
-api=ROOT/'vendor/xposed-api-101.jar'
-classpath=os.pathsep.join(map(str,[ANDROID,api]))
-sources=sorted((ROOT/'src').rglob('*.java'))
-run([JDK/'bin/javac.exe','--release','17','-encoding','UTF-8','-cp',classpath,'-d',classes,*sources])
-dex=BUILD/'dex'
-if dex.exists(): shutil.rmtree(dex)
-dex.mkdir()
-run([JDK/'bin/java.exe','-cp',BT/'lib/d8.jar','com.android.tools.r8.D8','--lib',ANDROID,'--classpath',api,'--min-api','35','--output',dex,*sorted(classes.rglob('*.class'))])
-compiled=BUILD/'resources.zip'
-run([BT/'aapt2.exe','compile','--dir',ROOT/'res','-o',compiled])
-resources=BUILD/'resources.apk'
-run([BT/'aapt2.exe','link','-I',ANDROID,'--manifest',ROOT/'AndroidManifest.xml','-o',resources,'-R',compiled,'--auto-add-overlay','--version-code',str(VERSION_CODE),'--version-name',VERSION_NAME,'-A',ROOT/'assets'])
-unsigned=BUILD/'unsigned.apk'
-shutil.copyfile(resources,unsigned)
-with zipfile.ZipFile(unsigned,'a',zipfile.ZIP_DEFLATED) as z:
-    for p in sorted(dex.glob('*.dex')): z.write(p,p.name)
-    for p in sorted((ROOT/'metadata').rglob('*')):
-        if p.is_file(): z.write(p,p.relative_to(ROOT/'metadata').as_posix())
-aligned=BUILD/'aligned.apk'
-run([BT/'zipalign.exe','-f','4',unsigned,aligned])
-private=ROOT/'private';private.mkdir(exist_ok=True)
-key=private/'signing.p12';password_file=private/'signing-password.txt'
-if not key.exists():
-    if not password_file.exists():password_file.write_text(secrets.token_hex(24),encoding='ascii')
-    run([JDK/'bin/keytool.exe','-genkeypair','-keystore',key,'-storetype','PKCS12','-storepass:file',password_file,'-alias','dolby-control','-keyalg','RSA','-keysize','3072','-validity','10000','-dname','CN=Dolby Control Local'])
-output=ROOT.parents[1]/f'outputs/Dolby_Control_v{VERSION_NAME}.apk'
-output.parent.mkdir(exist_ok=True)
-run([JDK/'bin/java.exe','-jar',BT/'lib/apksigner.jar','sign','--ks',key,'--ks-key-alias','dolby-control','--ks-pass','file:'+str(password_file),'--out',output,aligned])
-verification=run([JDK/'bin/java.exe','-jar',BT/'lib/apksigner.jar','verify','--verbose','--print-certs',output])
-identity={'path':str(output),'bytes':output.stat().st_size,'sha256':hashlib.sha256(output.read_bytes()).hexdigest(),'build':token,'source_count':len(sources),'native_sha256':native_hash}
-(BUILD/'identity.json').write_text(json.dumps(identity,ensure_ascii=False,indent=2),encoding='utf-8')
-(BUILD/'signature.txt').write_text(verification,encoding='utf-8')
-print(json.dumps(identity,ensure_ascii=False,indent=2))
+def archive_file(archive, source, name):
+    entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    entry.compress_type = zipfile.ZIP_DEFLATED
+    entry.external_attr = 0o100644 << 16
+    archive.writestr(entry, source.read_bytes())
+
+
+def validate_paths(args):
+    key, password_file = args.key.resolve(), args.password_file.resolve()
+    if key == password_file:
+        raise ValueError("Signing key and password must be different files")
+    suffix = "-unsigned" if args.unsigned else ""
+    output = (
+        args.output or ROOT / "dist" / f"Dolby_Control_v{CONFIG['version_name']}{suffix}.apk"
+    ).resolve()
+    if output.suffix.lower() != ".apk" or output in (key, password_file):
+        raise ValueError("Output must be an APK path distinct from signing material")
+    for name in (
+        "private",
+        ".git",
+        "src",
+        "res",
+        "metadata",
+        "tools",
+        "tests",
+        "vendor",
+        "assets",
+        "LICENSES",
+    ):
+        if output.is_relative_to(ROOT / name):
+            raise ValueError("Output cannot overwrite project inputs or private files")
+    return output
+
+
+def build(args):
+    output = validate_paths(args)
+    sdk, jdk = sdk_root(), java_home()
+    tools = sdk / "build-tools" / CONFIG["build_tools"]
+    android = (
+        sdk
+        / "platforms"
+        / os.environ.get("DCL_ANDROID_PLATFORM", CONFIG["platform"])
+        / "android.jar"
+    )
+    api = ROOT / "vendor/xposed-api-101.jar"
+    if not android.is_file():
+        raise RuntimeError(f"Android platform missing: {android}")
+    if not api.is_file() or sha256(api) != DEPENDENCIES["libxposed_api"]["jar_sha256"]:
+        raise RuntimeError("Missing/unverified compile-only API; run python tools/fetch_deps.py")
+    # Always rebuild native sources; never silently package a stale helper.
+    subprocess.run([sys.executable, str(ROOT / "tools/build_native.py")], check=True)
+    build_dir = ROOT / "build"
+    build_dir.mkdir(exist_ok=True)
+    native_hash = sha256(ROOT / "assets/backend/table-runtime")
+    token_hash = hashlib.sha256()
+    inputs = [ROOT / "project.json", ROOT / "AndroidManifest.xml"]
+    for directory in ("src", "res", "metadata"):
+        inputs += [
+            p
+            for p in (ROOT / directory).rglob("*")
+            if p.is_file() and p.name != "BuildIdentity.java"
+        ]
+    for path in sorted(inputs, key=lambda item: item.relative_to(ROOT).as_posix()):
+        name = path.relative_to(ROOT).as_posix().encode()
+        token_hash.update(len(name).to_bytes(4, "big") + name)
+        token_hash.update(hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).digest())
+    token_hash.update(native_hash.encode())
+    token = token_hash.hexdigest()[:24]
+    identity_source = build_dir / "generated/io/github/dcl/app/BuildIdentity.java"
+    identity_source.parent.mkdir(parents=True, exist_ok=True)
+    identity_source.write_text(
+        "package io.github.dcl.app;\npublic final class BuildIdentity {\n"
+        f'    public static final String TOKEN = "{token}";\n'
+        f'    public static final String NATIVE_SHA256 = "{native_hash}";\n'
+        "    private BuildIdentity() {}\n}\n",
+        encoding="utf-8",
+    )
+    classes, dex = build_dir / "classes", build_dir / "dex"
+    for directory in (classes, dex):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+    sources = sorted(p for p in (ROOT / "src").rglob("*.java") if p.name != "BuildIdentity.java")
+    sources.append(identity_source)
+    java = executable(jdk / "bin", "java")
+    run(
+        [
+            executable(jdk / "bin", "javac"),
+            "--release",
+            "17",
+            "-encoding",
+            "UTF-8",
+            "-cp",
+            os.pathsep.join(map(str, [android, api])),
+            "-d",
+            classes,
+            *sources,
+        ]
+    )
+    run(
+        [
+            java,
+            "-cp",
+            tools / "lib/d8.jar",
+            "com.android.tools.r8.D8",
+            "--lib",
+            android,
+            "--classpath",
+            api,
+            "--min-api",
+            CONFIG["min_sdk"],
+            "--output",
+            dex,
+            *sorted(classes.rglob("*.class")),
+        ]
+    )
+    compiled, resources = build_dir / "resources.zip", build_dir / "resources.apk"
+    aapt2 = executable(tools, "aapt2")
+    run([aapt2, "compile", "--dir", ROOT / "res", "-o", compiled])
+    run(
+        [
+            aapt2,
+            "link",
+            "-I",
+            android,
+            "--manifest",
+            ROOT / "AndroidManifest.xml",
+            "-o",
+            resources,
+            "-R",
+            compiled,
+            "--auto-add-overlay",
+            "--version-code",
+            CONFIG["version_code"],
+            "--version-name",
+            CONFIG["version_name"],
+            "-A",
+            ROOT / "assets",
+        ]
+    )
+    unsigned, aligned = build_dir / "unsigned.apk", build_dir / "aligned.apk"
+    shutil.copyfile(resources, unsigned)
+    with zipfile.ZipFile(unsigned, "a") as archive:
+        for path in sorted(dex.glob("*.dex")):
+            archive_file(archive, path, path.name)
+        for path in sorted((ROOT / "metadata").rglob("*")):
+            if path.is_file():
+                archive_file(archive, path, path.relative_to(ROOT / "metadata").as_posix())
+        for path in sorted((ROOT / "LICENSES").glob("*")):
+            archive_file(archive, path, "META-INF/licenses/" + path.name)
+        for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+            archive_file(archive, ROOT / name, "META-INF/licenses/" + name)
+    run([executable(tools, "zipalign"), "-f", "4", unsigned, aligned])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if args.unsigned:
+        shutil.copyfile(aligned, output)
+    else:
+        key, password_file = args.key.resolve(), args.password_file.resolve()
+        if not key.exists():
+            if not args.init_signing:
+                raise RuntimeError(
+                    "Signing key missing. Reuse your existing key, or explicitly pass --init-signing for a NEW identity"
+                )
+            key.parent.mkdir(parents=True, exist_ok=True)
+            password_file.parent.mkdir(parents=True, exist_ok=True)
+            if not password_file.exists():
+                password_file.write_text(secrets.token_hex(24), encoding="ascii")
+                if os.name != "nt":
+                    password_file.chmod(0o600)
+            run(
+                [
+                    executable(jdk / "bin", "keytool"),
+                    "-genkeypair",
+                    "-keystore",
+                    key,
+                    "-storetype",
+                    "PKCS12",
+                    "-storepass:file",
+                    password_file,
+                    "-alias",
+                    "dolby-control",
+                    "-keyalg",
+                    "RSA",
+                    "-keysize",
+                    "3072",
+                    "-validity",
+                    "10000",
+                    "-dname",
+                    "CN=Dolby Control Local",
+                ]
+            )
+        if not password_file.is_file():
+            raise RuntimeError("Signing password file missing")
+        signer = tools / "lib/apksigner.jar"
+        run(
+            [
+                java,
+                "-jar",
+                signer,
+                "sign",
+                "--ks",
+                key,
+                "--ks-key-alias",
+                "dolby-control",
+                "--ks-pass",
+                "file:" + str(password_file),
+                "--out",
+                output,
+                aligned,
+            ]
+        )
+        verification = run([java, "-jar", signer, "verify", "--verbose", "--print-certs", output])
+        (build_dir / "signature.txt").write_text(verification, encoding="utf-8")
+    identity = {
+        "path": str(output),
+        "version": CONFIG["version_name"],
+        "signed": not args.unsigned,
+        "bytes": output.stat().st_size,
+        "sha256": sha256(output),
+        "build": token,
+        "source_count": len(sources),
+        "native_sha256": native_hash,
+    }
+    (build_dir / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    print(json.dumps(identity, indent=2))
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--unsigned", action="store_true", help="Build for CI without accessing a signing identity"
+    )
+    parser.add_argument(
+        "--init-signing",
+        action="store_true",
+        help="Explicitly create a NEW local signing identity if absent",
+    )
+    parser.add_argument("--key", type=Path, default=ROOT / "private/signing.p12")
+    parser.add_argument("--password-file", type=Path, default=ROOT / "private/signing-password.txt")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    try:
+        build(args)
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as error:
+        parser.exit(1, f"Build failed: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

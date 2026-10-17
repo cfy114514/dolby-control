@@ -49,15 +49,18 @@ public final class MainActivity extends Activity {
     private final Map<String, Record> records = new LinkedHashMap<>();
     private final Map<String, Integer> pending = new LinkedHashMap<>();
     private final Map<String, Binding> bindings = new LinkedHashMap<>();
+    private final Map<String, String> invalidInputs = new LinkedHashMap<>();
     private final List<View> editViews = new ArrayList<>();
     private FrameLayout root;
     private Button neutralButton, presetButton, enableButton, applyButton;
     private TextView homeState, adjustLink, settingsMessage, editCount, refreshButton;
     private LinearLayout settingsBody;
-    private boolean destroyed, inFlight, settingsPage, ready, active, supported;
-    private boolean moreOpen;
+    private boolean destroyed, inFlight, settingsPage, ready, active, supported, formFresh;
+    private boolean moreOpen, homeNoticeError;
     private int profile = -1, settingsProfile = -1;
     private String enhancement = "unknown", formSignature = "", homeNotice = "";
+    private String tableIdentity = "";
+    private JSONObject restoredDraft;
     private final OnBackInvokedCallback back = this::goBack;
 
     private interface Job { JSONObject run() throws Exception; }
@@ -82,7 +85,34 @@ public final class MainActivity extends Activity {
         setContentView(root);
         getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                 android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, back);
-        showHome();
+        if (savedState != null) {
+            moreOpen = savedState.getBoolean("more_open", false);
+            try { restoredDraft = new JSONObject(savedState.getString("edit_draft", "{}")); }
+            catch (Exception ignored) { restoredDraft = null; }
+        }
+        if (savedState != null && savedState.getBoolean("settings_page", false)) showSettings();
+        else showHome();
+    }
+
+    @Override public void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putBoolean("settings_page", settingsPage);
+        state.putBoolean("more_open", moreOpen);
+        try {
+            if (restoredDraft != null) {
+                state.putString("edit_draft", restoredDraft.toString());
+                return;
+            }
+            JSONObject draft = new JSONObject().put("profile", settingsProfile)
+                    .put("table_identity", tableIdentity).put("baseline", baseline(records))
+                    .put("pending", new JSONObject(pending));
+            JSONObject invalid = new JSONObject();
+            for (Map.Entry<String, Binding> entry : bindings.entrySet()) {
+                if (entry.getValue().invalid) invalid.put(entry.getKey(), entry.getValue().inputText());
+            }
+            draft.put("invalid", invalid);
+            state.putString("edit_draft", draft.toString());
+        } catch (Exception ignored) { /* A fresh read is safer than a partial draft. */ }
     }
 
     @Override public void onResume() {
@@ -94,6 +124,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onDestroy() {
         destroyed = true;
+        main.removeCallbacksAndMessages(null);
         getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(back);
         worker.shutdown();
         super.onDestroy();
@@ -183,6 +214,7 @@ public final class MainActivity extends Activity {
 
     private void showHome() {
         settingsPage = false;
+        formFresh = false;
         root.removeAllViews();
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -273,7 +305,7 @@ public final class MainActivity extends Activity {
         else if ("custom".equals(enhancement)) homeState.setText("已使用自定义调节");
         else if ("unknown".equals(enhancement)) homeState.setText("增强状态暂未读到，轻点重试。");
         else homeState.setText("");
-        homeState.setTextColor(homeNotice.isEmpty() ? MUTED : ERROR);
+        homeState.setTextColor(homeNotice.isEmpty() || !homeNoticeError ? MUTED : ERROR);
     }
 
     private void fetchStatus() {
@@ -333,6 +365,12 @@ public final class MainActivity extends Activity {
                 profile = status.optInt("profile", -1);
                 enhancement = status.optString("enhancement", "unknown");
                 pending.clear();
+                invalidInputs.clear();
+                restoredDraft = null;
+                if (status.optBoolean("pending", false) || !status.optBoolean("dsp_observed", false)) {
+                    homeNotice = editMessage(status);
+                    homeNoticeError = false;
+                }
                 bindHome();
             } else {
                 enhancement = "unknown";
@@ -344,11 +382,13 @@ public final class MainActivity extends Activity {
 
     private void showHomeError(String text) {
         homeNotice = text;
+        homeNoticeError = true;
         bindHome();
     }
 
     private void showSettings() {
         settingsPage = true;
+        formFresh = false;
         root.removeAllViews();
         LinearLayout page = vertical();
         LinearLayout toolbar = horizontal();
@@ -370,9 +410,11 @@ public final class MainActivity extends Activity {
             if (inFlight) return;
             if (!pending.isEmpty() || hasInvalid()) {
                 pending.clear();
+                invalidInputs.clear();
                 for (Binding binding : bindings.values()) binding.bind(binding.record);
                 updateEditFooter();
-            } else fetchSettings();
+            }
+            fetchSettings();
         });
         toolbar.addView(refreshButton);
         page.addView(toolbar, matchWrap());
@@ -398,19 +440,20 @@ public final class MainActivity extends Activity {
         root.addView(page, new FrameLayout.LayoutParams(-1, -1));
         formSignature = "";
         bindings.clear(); editViews.clear();
-        if (!pending.isEmpty() && settingsProfile == profile && !records.isEmpty()) {
-            buildForm();
-            settingsMessage.setText("有尚未应用的调整");
-            updateEditFooter();
-        } else fetchSettings();
+        // Always validate a retained draft against a fresh profile/table read.
+        // The user may have changed the native Dolby page while this page was away.
+        fetchSettings();
     }
 
     private void fetchSettings() {
+        captureInvalidInputs();
+        formFresh = false;
         run(() -> RootClient.call("settings", new JSONObject()), (result, error) -> {
             if (!settingsPage) return;
             if (error != null || result == null || !result.optBoolean("ok", false)) {
                 settingsMessage.setText("暂时无法读取，轻点右上角重试。");
                 settingsMessage.setTextColor(ERROR);
+                formFresh = false;
                 updateEditFooter();
                 return;
             }
@@ -421,16 +464,38 @@ public final class MainActivity extends Activity {
     private void installSettings(JSONObject data, boolean afterApply) {
         boolean isActive = data.optBoolean("active", false);
         int actualProfile = data.optInt("profile", -1);
-        boolean scopeChanged = settingsProfile != actualProfile && !pending.isEmpty();
-        if (afterApply || settingsProfile != actualProfile) pending.clear();
-        active = isActive; profile = actualProfile; settingsProfile = actualProfile;
-        records.clear();
+        String identity = data.optString("table_identity", "");
+        Map<String, Record> fresh = new LinkedHashMap<>();
         JSONArray list = data.optJSONArray("records");
         if (isActive && supportedProfile(actualProfile) && list != null) {
             for (int i = 0; i < list.length(); i++) {
                 Record record = Record.read(list.optJSONObject(i), actualProfile);
-                if (record != null) records.put(record.id(), record);
+                if (record != null) fresh.put(record.id(), record);
             }
+        }
+        boolean hadDraft = !pending.isEmpty() || !invalidInputs.isEmpty();
+        boolean scopeChanged = hadDraft && (settingsProfile != actualProfile ||
+                !sameBaseline(baseline(records), fresh) || !sameIdentity(tableIdentity, identity));
+        if (afterApply || scopeChanged) { pending.clear(); invalidInputs.clear(); }
+        ready = data.optBoolean("ready", false);
+        supported = data.optBoolean("enhancement_supported", false);
+        enhancement = data.optString("enhancement", "unknown");
+        active = isActive; profile = actualProfile; settingsProfile = actualProfile;
+        tableIdentity = identity;
+        records.clear(); records.putAll(fresh);
+        if (restoredDraft != null) {
+            JSONObject draft = restoredDraft;
+            restoredDraft = null;
+            JSONObject values = draft.optJSONObject("pending"), invalid = draft.optJSONObject("invalid");
+            boolean savedEdits = (values != null && values.length() > 0) || (invalid != null && invalid.length() > 0);
+            if (savedEdits && draft.optInt("profile", -99) == actualProfile &&
+                    sameBaseline(draft.optJSONArray("baseline"), fresh) &&
+                    sameIdentity(draft.optString("table_identity", ""), identity)) {
+                if (values != null) for (String id : fresh.keySet())
+                    if (values.has(id)) pending.put(id, values.optInt(id));
+                if (invalid != null) for (String id : fresh.keySet())
+                    if (invalid.has(id)) invalidInputs.put(id, invalid.optString(id));
+            } else if (savedEdits) scopeChanged = true;
         }
         for (String id : new ArrayList<>(pending.keySet())) {
             Record record = records.get(id);
@@ -443,12 +508,50 @@ public final class MainActivity extends Activity {
             Record record = records.get(entry.getKey());
             if (record != null) entry.getValue().bind(record);
         }
-        if (!isActive) settingsMessage.setText("空间效果尚未激活，播放音频后刷新。");
+        formFresh = ready && isActive && supportedProfile(actualProfile) && list != null;
+        if (afterApply && data.optBoolean("pending", false)) settingsMessage.setText(editMessage(data));
+        else if (!isActive) settingsMessage.setText("空间效果尚未激活，播放音频后刷新。");
         else if (records.isEmpty()) settingsMessage.setText("当前声音模式没有可调项目。");
-        else settingsMessage.setText(scopeChanged ? "声音模式已变化，未应用的调整已清除。" :
-                afterApply ? "调整已应用" : "调整只在点“应用调整”后生效。");
+        else settingsMessage.setText(scopeChanged ? "声音设置已变化，未应用的调整已清除。" :
+                afterApply ? editMessage(data) : "调整只在点“应用调整”后生效。");
         settingsMessage.setTextColor(MUTED);
         updateEditFooter();
+    }
+
+    private static String editMessage(JSONObject result) {
+        if (result.optBoolean("pending", false)) return "调整已保存，等待声音模式激活。";
+        if (!result.optBoolean("dsp_observed", false)) return "设置已保存，尚未确认实时生效。";
+        return "调整已应用";
+    }
+
+    private static boolean sameIdentity(String before, String after) {
+        return before.isEmpty() || after.isEmpty() || before.equals(after);
+    }
+
+    private static JSONArray baseline(Map<String, Record> source) {
+        JSONArray result = new JSONArray();
+        for (Record record : source.values()) {
+            try { result.put(new JSONObject().put("profile", record.profile).put("key", record.key).put("current", record.current)); }
+            catch (Exception impossible) { throw new IllegalStateException(impossible); }
+        }
+        return result;
+    }
+
+    private static boolean sameBaseline(JSONArray before, Map<String, Record> after) {
+        if (before == null || before.length() != after.size()) return false;
+        for (int i = 0; i < before.length(); i++) {
+            JSONObject previous = before.optJSONObject(i);
+            if (previous == null) return false;
+            Record record = after.get(previous.optInt("profile", -99) + ":" + previous.optString("key", ""));
+            if (record == null || !previous.has("current") || record.current != previous.optInt("current")) return false;
+        }
+        return true;
+    }
+
+    private void captureInvalidInputs() {
+        for (Map.Entry<String, Binding> entry : bindings.entrySet()) {
+            if (entry.getValue().invalid) invalidInputs.put(entry.getKey(), entry.getValue().inputText());
+        }
     }
 
     private Record find(String key) {
@@ -622,6 +725,11 @@ public final class MainActivity extends Activity {
                     if (!target.equals(input.getText().toString())) input.setText(target);
                     input.setTextColor(INK);
                 }
+                @Override String inputText() { return input.getText().toString(); }
+                @Override void restoreInvalid(String value) {
+                    input.setText(value);
+                    input.setTextColor(ERROR);
+                }
             };
             bindings.put(record.id(), binding);
             input.addTextChangedListener(new TextWatcher() {
@@ -636,6 +744,7 @@ public final class MainActivity extends Activity {
                         changed(binding, value);
                     } catch (NumberFormatException invalid) {
                         binding.invalid = true;
+                        invalidInputs.put(binding.record.id(), s.toString());
                         input.setTextColor(ERROR);
                         updateEditFooter();
                     }
@@ -659,14 +768,23 @@ public final class MainActivity extends Activity {
             record = updated;
             invalid = false;
             binding = true;
-            try { show(pending.containsKey(record.id()) ? pending.get(record.id()) : record.current); }
+            try {
+                show(pending.containsKey(record.id()) ? pending.get(record.id()) : record.current);
+                if (invalidInputs.containsKey(record.id())) {
+                    restoreInvalid(invalidInputs.get(record.id()));
+                    invalid = true;
+                }
+            }
             finally { binding = false; }
         }
+        String inputText() { return ""; }
+        void restoreInvalid(String value) { }
         abstract void show(int value);
     }
 
     private void changed(Binding binding, int value) {
         binding.invalid = false;
+        invalidInputs.remove(binding.record.id());
         if (value == binding.record.current) pending.remove(binding.record.id());
         else pending.put(binding.record.id(), value);
         updateEditFooter();
@@ -679,7 +797,7 @@ public final class MainActivity extends Activity {
 
     private void updateEditFooter() {
         if (!settingsPage || applyButton == null) return;
-        boolean available = ready && active && supportedProfile(settingsProfile);
+        boolean available = formFresh && ready && active && supportedProfile(settingsProfile);
         boolean enabled = available && !inFlight;
         for (View control : editViews) control.setEnabled(enabled);
         applyButton.setEnabled(enabled && !pending.isEmpty() && !hasInvalid());
@@ -693,17 +811,21 @@ public final class MainActivity extends Activity {
     }
 
     private void applyEdits() {
-        if (pending.isEmpty() || hasInvalid()) return;
+        if (!formFresh || !ready || !active || inFlight || pending.isEmpty() || hasInvalid()) return;
         final JSONObject args = new JSONObject();
         final JSONArray edits = new JSONArray();
+        final JSONArray expected = new JSONArray();
         try {
             for (Map.Entry<String, Integer> entry : pending.entrySet()) {
                 Record record = records.get(entry.getKey());
                 if (record == null) continue;
                 edits.put(new JSONObject().put("profile", record.profile).put("key", record.key).put("value", entry.getValue()));
+                expected.put(new JSONObject().put("profile", record.profile).put("key", record.key).put("current", record.current));
             }
             if (edits.length() == 0) return;
             args.put("edits", edits);
+            args.put("expected_records", expected).put("expected_profile", settingsProfile);
+            if (!tableIdentity.isEmpty()) args.put("expected_table_identity", tableIdentity);
         } catch (Exception invalid) { return; }
         run(() -> {
             JSONObject changed = RootClient.call("edit", args);
@@ -717,6 +839,7 @@ public final class MainActivity extends Activity {
         }, (result, error) -> {
             if (error != null || result == null || !result.optBoolean("ok", false)) {
                 enhancement = "unknown";
+                formFresh = false;
                 if (settingsPage) {
                     settingsMessage.setText("调整未完成，声音状态可能已变化，请还原后刷新。");
                     settingsMessage.setTextColor(ERROR);
@@ -725,6 +848,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             pending.clear();
+            invalidInputs.clear();
             JSONObject fresh = result.optJSONObject("settings");
             if (fresh != null && fresh.optBoolean("ok", false)) {
                 if (settingsPage) installSettings(fresh, true);

@@ -37,11 +37,15 @@ public final class SoundAliveHook extends XposedModule {
     private ExecutorService worker;
     private Map<Activity, WeakReference<Page>> pages;
     private AtomicBoolean statusQueued;
-    private AtomicBoolean reassertQueued;
+    private LatestTask<ManualChoice> manualTasks;
+    private LatestTask<Boolean> reassertTasks;
+    private volatile ManualChoice latestManualChoice;
+    private volatile boolean controllerKnownReady;
     private ThreadLocal<Integer> explicitDepth;
     private Method nativeUpdate;
     private boolean installed;
     private boolean repainting;
+    private long lastFailureLog = -30000;
 
     @Override public void onPackageReady(PackageReadyParam param) {
         if (!PACKAGE.equals(param.getPackageName()) || installed) return;
@@ -54,6 +58,8 @@ public final class SoundAliveHook extends XposedModule {
             Method update = activity.getDeclaredMethod("B");
             Method selectRadio = activity.getDeclaredMethod("z", int.class);
             Method resume = activity.getDeclaredMethod("onResume");
+            Method pause = inheritedMethod(activity, "onPause");
+            Method destroy = activity.getDeclaredMethod("onDestroy");
             Method manual = effects.getDeclaredMethod("k", int.class);
             Method apply = effects.getDeclaredMethod("i", int.class, boolean.class);
             main = new Handler(Looper.getMainLooper());
@@ -64,7 +70,19 @@ public final class SoundAliveHook extends XposedModule {
             });
             pages = new WeakHashMap<>();
             statusQueued = new AtomicBoolean();
-            reassertQueued = new AtomicBoolean();
+            manualTasks = new LatestTask<>(worker, android.os.SystemClock::elapsedRealtime, 20000,
+                    (choice, deadline) -> {
+                        try {
+                            deliver(checked(RootClient.callBefore("manual",
+                                    new JSONObject().put("profile", choice.profile), deadline)));
+                        } catch (Throwable error) { failed(error, choice.source, true, choice); }
+                    }, choice -> failed(new java.io.IOException("Mode selection expired"),
+                            choice.source, true, choice));
+            reassertTasks = new LatestTask<>(worker, android.os.SystemClock::elapsedRealtime, 20000,
+                    (ignored, deadline) -> {
+                        try { deliver(checked(RootClient.callBefore("reassert", new JSONObject(), deadline))); }
+                        catch (Throwable error) { failed(error, null, false); }
+                    }, ignored -> { });
             explicitDepth = new ThreadLocal<>();
             nativeUpdate = update;
 
@@ -84,16 +102,16 @@ public final class SoundAliveHook extends XposedModule {
                     if (ordinary) {
                         if (previous == null) explicitDepth.remove();
                         else explicitDepth.set(previous);
-                        // The nested native i() has now finished. This task is
-                        // queued after manual, even if another restore is pending.
-                        enqueueReassert(true);
+                        // The nested native i() has finished. Keep only the
+                        // newest pending restore, after the latest manual intent.
+                        enqueueReassert();
                     }
                 }
             }));
             handles.add(hook(apply).intercept(chain -> {
                 Object result = chain.proceed();
                 Integer depth = explicitDepth.get();
-                if (depth == null || depth == 0) enqueueReassert(false);
+                if (depth == null || depth == 0) enqueueReassert();
                 return result;
             }));
             handles.add(hook(initRows).intercept(chain -> {
@@ -116,6 +134,15 @@ public final class SoundAliveHook extends XposedModule {
                 safePage((Activity) chain.getThisObject(), true);
                 return result;
             }));
+            handles.add(hook(pause).intercept(chain -> {
+                if (activity.isInstance(chain.getThisObject()))
+                    stopPage((Activity) chain.getThisObject(), false);
+                return chain.proceed();
+            }));
+            handles.add(hook(destroy).intercept(chain -> {
+                stopPage((Activity) chain.getThisObject(), true);
+                return chain.proceed();
+            }));
             // These exact shipped callers may already contain AOT-inlined
             // copies of k()/i(). Deoptimize only their narrow entry points.
             deoptimize(manual);
@@ -137,6 +164,14 @@ public final class SoundAliveHook extends XposedModule {
     private void deoptimizeCaller(ClassLoader loader, String type, String name, Class<?>... args) {
         try { deoptimize(Class.forName(type, false, loader).getDeclaredMethod(name, args)); }
         catch (Throwable error) { Log.w(TAG, "Optional caller deoptimization unavailable: " + type + "." + name, error); }
+    }
+
+    private static Method inheritedMethod(Class<?> type, String name) throws NoSuchMethodException {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            try { return current.getDeclaredMethod(name); }
+            catch (NoSuchMethodException ignored) { }
+        }
+        throw new NoSuchMethodException(name);
     }
 
     private void safePage(Activity activity, boolean inject) {
@@ -164,6 +199,7 @@ public final class SoundAliveHook extends XposedModule {
             // while the asynchronous actual-mode read is in flight.
             page.radio.setChecked(false);
             page.syncEnabled();
+            if (inject) page.startPoll();
             enqueueStatus();
         } catch (Throwable error) {
             Log.e(TAG, "Cannot extend native mode rows", error);
@@ -224,41 +260,43 @@ public final class SoundAliveHook extends XposedModule {
             throw error;
         }
         page.syncEnabled();
-        page.startPoll();
         return page;
     }
 
-    private void enqueueManual(int profile, Page source) {
+    private void stopPage(Activity activity, boolean remove) {
+        if (Looper.myLooper() != Looper.getMainLooper()) return;
+        WeakReference<Page> reference = remove ? pages.remove(activity) : pages.get(activity);
+        Page page = reference == null ? null : reference.get();
+        if (page != null) page.stopPoll();
+    }
+
+    private synchronized void enqueueManual(int profile, Page source) {
         try {
-            WeakReference<Page> reference = new WeakReference<>(source);
-            worker.execute(() -> {
-                try {
-                    JSONObject result = checked(RootClient.call("manual", new JSONObject().put("profile", profile)));
-                    deliver(result);
-                } catch (Throwable error) {
-                    failed(error, reference, true);
-                }
-            });
+            ManualChoice choice = new ManualChoice(profile, source, controllerKnownReady);
+            latestManualChoice = choice;
+            manualTasks.submit(choice);
         } catch (Throwable error) {
             Log.e(TAG, "Cannot queue manual mode", error);
         }
     }
 
-    private void enqueueReassert(boolean explicit) {
+    private void enqueueReassert() {
         try {
-            if (!explicit && !reassertQueued.compareAndSet(false, true)) return;
-            worker.execute(() -> {
-                try {
-                    deliver(checked(RootClient.call("reassert", new JSONObject())));
-                } catch (Throwable error) {
-                    failed(error, null, false);
-                } finally {
-                    if (!explicit) reassertQueued.set(false);
-                }
-            });
+            reassertTasks.submit(Boolean.TRUE);
         } catch (Throwable error) {
-            if (!explicit && reassertQueued != null) reassertQueued.set(false);
             Log.e(TAG, "Cannot queue mode restore", error);
+        }
+    }
+
+    private static final class ManualChoice {
+        final int profile;
+        final WeakReference<Page> source;
+        final boolean wasReady;
+
+        ManualChoice(int profile, Page source, boolean wasReady) {
+            this.profile = profile;
+            this.source = new WeakReference<>(source);
+            this.wasReady = wasReady;
         }
     }
 
@@ -281,7 +319,7 @@ public final class SoundAliveHook extends XposedModule {
     }
 
     private static JSONObject checked(JSONObject result) throws Exception {
-        if (result == null || (result.has("ok") && !result.optBoolean("ok")))
+        if (result == null || !result.optBoolean("ok", false))
             throw new Exception(result == null ? "Controller unavailable" : result.optString("error", "Controller rejected request"));
         // The controller's flat status contract is deliberately strict: no
         // inference from a remembered target to the actual runtime profile.
@@ -294,6 +332,7 @@ public final class SoundAliveHook extends XposedModule {
 
     private void deliver(JSONObject result) {
         main.post(() -> {
+            controllerKnownReady = result.optBoolean("ready", false);
             for (WeakReference<Page> reference : new ArrayList<>(pages.values())) {
                 Page page = reference.get();
                 if (page != null) {
@@ -305,17 +344,35 @@ public final class SoundAliveHook extends XposedModule {
     }
 
     private void failed(Throwable error, WeakReference<Page> source, boolean notify) {
-        Log.w(TAG, "Controller request failed", error);
+        failed(error, source, notify, null);
+    }
+
+    private void failed(Throwable error, WeakReference<Page> source, boolean notify, ManualChoice choice) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - lastFailureLog >= 30000 || notify) {
+            lastFailureLog = now;
+            Log.w(TAG, "Controller request failed", error);
+        }
         main.post(() -> {
+            Page origin = source == null ? null : source.get();
+            Activity owner = origin == null ? foregroundActivity() : origin.activity.get();
+            boolean ordinary = choice != null && choice.profile >= 0 && choice.profile <= 3;
+            boolean knownReady = choice != null && choice.wasReady;
+            for (WeakReference<Page> reference : new ArrayList<>(pages.values())) {
+                Page page = reference.get();
+                if (page != null && page.ready && page.activity.get() == owner) knownReady = true;
+            }
             for (WeakReference<Page> reference : new ArrayList<>(pages.values())) {
                 Page page = reference.get();
                 if (page != null) page.unavailable();
             }
-            if (notify) {
-                Page page = source == null ? null : source.get();
-                Activity activity = page == null ? foregroundActivity() : page.activity.get();
-                if (activity != null && !activity.isFinishing())
-                    Toast.makeText(activity, words(activity, "切换未确认，请检查 Dolby Control 后台", "Mode not confirmed; check Dolby Control"), Toast.LENGTH_SHORT).show();
+            controllerKnownReady = false;
+            boolean current = choice == null || latestManualChoice == choice;
+            if (notify && current && (!ordinary || knownReady) && owner != null &&
+                    !owner.isFinishing() && !owner.isDestroyed() && owner.hasWindowFocus()) {
+                Toast.makeText(owner, ordinary
+                        ? words(owner, "系统档位已切换，保持选择未确认，请重试", "System mode changed; selection hold is unconfirmed. Please retry.")
+                        : words(owner, "切换未确认，请检查 Dolby Control 后台", "Mode not confirmed; check Dolby Control"), Toast.LENGTH_SHORT).show();
             }
         });
     }
@@ -360,6 +417,7 @@ public final class SoundAliveHook extends XposedModule {
         final TextView description;
         boolean ready;
         boolean overriding;
+        Runnable poll;
 
         Page(Activity owner, ViewGroup container, LinearLayout row, RadioButton radio, View nativeMusic, TextView description) {
             this.activity = new WeakReference<>(owner);
@@ -420,21 +478,31 @@ public final class SoundAliveHook extends XposedModule {
         }
 
         void startPoll() {
+            if (poll != null) return;
             WeakReference<Page> reference = new WeakReference<>(this);
-            main.postDelayed(new Runnable() {
+            poll = new Runnable() {
                 @Override public void run() {
                     Page page = reference.get();
                     if (page == null) return;
                     Activity owner = page.activity.get();
                     if (owner == null || owner.isDestroyed() || owner.isFinishing() ||
-                            owner.findViewById(id(owner, "layout_dolby_atmos_mode")) != page.container) return;
+                            owner.findViewById(id(owner, "layout_dolby_atmos_mode")) != page.container) {
+                        page.poll = null;
+                        return;
+                    }
                     if (owner.hasWindowFocus() && page.row.isAttachedToWindow()) {
                         page.syncEnabled();
                         enqueueStatus();
                     }
                     main.postDelayed(this, 1500);
                 }
-            }, 1500);
+            };
+            main.postDelayed(poll, 1500);
+        }
+
+        void stopPoll() {
+            if (poll != null) main.removeCallbacks(poll);
+            poll = null;
         }
     }
 }

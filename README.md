@@ -1,43 +1,57 @@
-# Dolby Control 0.6.1
+# Dolby Control
 
-已安装在这台 Samsung S23 上的独立音效应用。KernelSU 提供应用自己的 Root 授权；LSPosed 只作用于 `com.sec.android.app.soundalive`，为三星杜比页面增加 Spatial Audio。旧 `dolby_control_lab` KernelSU WebUI 模块已卸载，备份保留在手机 Root 私有备份目录。
+[![Build and test](https://github.com/cfy114514/dolby-control/actions/workflows/ci.yml/badge.svg)](https://github.com/cfy114514/dolby-control/actions/workflows/ci.yml)
 
-## 日常使用
+为三星 S23 编写的独立音效应用。KernelSU 提供应用自己的 Root 权限；LSPosed 只作用于三星 SoundAlive，在系统“杜比全景声”页面加入 **Spatial Audio** 档位。无需旧的 KernelSU WebUI 模块。
 
-- 档位在系统“杜比全景声”页面选择。Music 和 Spatial Audio 的手选会跨暂停、继续、切歌和页面重开保持；手选“自动”解除保持。
-- 应用首页只有增强处理和声音调节入口。关闭增强保留空间渲染，且不重置数值设置。
-- 声音调节显示当前档位自己的参数；共用强度和目标值明确标记为所有档位共用。修改先暂存，点“应用调整”后批量写入并回读。
-- 三星预设恢复经过验证的原厂参数。Spatial Audio 保留自己的耳机渲染调校，没有将它替换成 Music。
+## 功能
 
-原厂 Music 开启智能均衡、关闭对白增强与其元数据引导；原厂 Spatial Audio 相反。两者还使用不同的耳机渲染参数。当前用户的“关闭增强”会覆盖对应增强开关，因此不应将关闭增强后的表现当作原厂默认。
+- 系统页面切档，手选 Music 或 Spatial Audio 后，暂停、继续、切歌和页面重开保持选择。手选“自动”解除保持。
+- 首页只有“关闭增强 / 三星预设”和声音调节入口。关闭增强保留空间渲染及数值设置；三星预设恢复全部原厂参数。
+- 当前档位独立调节增强开关与强度；共用参数明确标注。调整先暂存，再一次批量应用。Spatial Audio 保留自己的渲染参数。
+- Root 后台独立保存和恢复设置；不修改系统文件，不主动开启已关闭的杜比。
 
-## 已验证
+Music 与 Spatial Audio 都使用现有空间处理器。原厂 Music 开启智能均衡，Spatial Audio 开启对白增强及其元数据引导，两者的耳机渲染参数不同。这不等同于 Apple 个性化空间音频或头部追踪。DDP/Atmos 播放时，系统会强制关闭实际音量均衡；保存为开启不代表 DSP 正在使用它。
 
-- APK 签名验证与安装文件 SHA256 一致；LSPosed 已启用，作用域仅三星音效。
-- 44 条固定参数均与这台手机的 SYSTEM 库逐项核对：35 个增强开关、5 个档位音量均衡强度、4 个共用数值。未将耳机或扬声器渲染记录加入写入范围。
-- 21 项 C++ 事务和参数解析测试通过，包括回滚、并发改动、进程身份改变、非法档位与越界值拒绝。
-- AirPods、Apple Music《克卜勒》Dolby Atmos 播放：Music 和 Spatial Audio 的暂停、继续、切歌、音乐页面重开及系统杜比页面重开保持验证通过。
-- Spatial Audio 的关闭增强、独立智能均衡/对白增强、音量均衡强度、共用对白强度和输出目标均观察到对应 DSP setter。调整后原设置已恢复。
-- 关闭杜比后播放/重新断言不会启用杜比；重新开启恢复手选；手选自动后播放不会被强制切到 Music。
-- 相同 APK 覆盖安装触发真实系统包更新事件，独立后台重启并恢复全部 44 项数值与手选；新进程绑定新 APK 路径。应用进程冷开耗时约 276 ms，不包括后台参数读取。
+## 兼容范围
 
-证据位于 `build/spatial-live-evidence.json`、`build/lifecycle-live-evidence.json`、`build/playback-profile-2.json`、`build/playback-profile-8.json`、`build/installed-integrity.json`。最后两份播放保持报告来自先前的同一切档实现，空间档写入和生命周期报告来自当前版本。
+目前只支持已核对的 **SM-S9110 / Android 16 / SoundAlive 16.1.32** 固件。适配器按固件指纹、SYSTEM 库哈希、进程身份、记录前缀及数值范围校验；其他固件会拒绝写入。具体版本和 44 个可写槽位见 [`table_spec.h`](src/native/table_spec.h)。不能仅去掉校验来支持其他机型。
 
-DDP/Atmos 分支会强制关闭实际音量均衡；保存开关为开不代表播放时 DSP 一定开启。共用数值会影响所有档位。尚未通过整机重启或耳机断连重连验证；已验证的后台重启采用系统包更新事件。
+安装自行签名的 APK，在 KernelSU 中给“音效”授予 Root，并在兼容现代 API 101 的 LSPosed 中启用模块，作用域只选 `com.sec.android.app.soundalive`。重新打开三星杜比页面，让新钩子载入。后台设置保存在 `/data/adb/dolby_control_app/`，与旧模块目录独立。
 
-## 构建和边界
+## 构建
 
-仅适配已校验的 S23 当前 Android 16 固件与 SYSTEM 库。原生 helper 在写入前验证固件、库哈希、映射身份、进程启动时间、固定记录前缀和数值范围；不修改系统文件或重启音频服务。
+需要 Python 3.11+、JDK 17+，以及 `project.json` 固定的 Android Platform 37.0、Build Tools 36.0.0、NDK 30.0.14904198。支持 Windows / Linux 构建；macOS 路径发现已支持，尚未验证。没有 Gradle 或运行时第三方界面库。
 
-已有 Android SDK 37、Build Tools 36、NDK 30 与 Android Studio JBR 环境下：
-
-```powershell
-python tools/verify_table_spec.py
-python tests/test_table_transaction.py
-python tools/build_native.py
-python tools/build.py
+```sh
+python tools/fetch_deps.py
+python -m unittest discover -s tests -v
+python tools/build.py --unsigned
+python tools/check_package.py
 ```
 
-APK 在本任务的 `outputs/Dolby_Control_v0.6.1.apk`。`private/` 保存本地升级签名材料，不能公开、删除或替换。`vendor/xposed-api-101.jar` 仅编译使用，不打入 APK。
+下载依赖与构建分离。`fetch_deps.py` 只从 Maven Central 下载锁定的编译期 API，并核对 AAR/JAR 的 SHA256。后续构建无需下载；每次会先重新编译原生 helper，避免误装旧二进制。
 
-后台状态独立位于 `/data/adb/dolby_control_app`。Root socket 只接受应用自身和核验过的三星音效进程；三星音效只能查状态、选择档位或恢复手选，不能运行任意 Root 命令。开机与包更新共用受保护广播接收器，仅在首次成功启用后启动。
+SDK 自动读取 `DCL_ANDROID_SDK` / `ANDROID_SDK_ROOT` / `ANDROID_HOME`；JDK 读取 `DCL_JAVA` / `JAVA_HOME`；NDK 可用 `DCL_ANDROID_NDK` 指定。没有环境变量时查找常见本机路径。输出位于 `dist/`，构建身份位于 `build/identity.json`。
+
+正式签名默认复用本地 `private/signing.p12` 与 `private/signing-password.txt`。新开发者第一次创建自己的签名可运行：
+
+```sh
+python tools/build.py --init-signing
+```
+
+已有签名时使用 `python tools/build.py`。密钥缺失会失败，不会静默换签；其他开发者生成的签名不能覆盖原签名应用。CI 只构建未签名 APK，不持有正式密钥。`private/`、构建物、设备证据、原厂库均不提交。
+
+## 验证与开发
+
+[`docs/TESTING.md`](docs/TESTING.md) 区分宿主回归、原厂 ELF 校验与真机验收。原厂库不分发，需自行提供：
+
+```sh
+python tools/verify_table_spec.py --library /path/to/original-libspatializerparamstorage.so --require-library
+```
+
+缺少原厂库时会明确显示 `SKIP`，不会算作已验证。0.6.1 曾在 S23、AirPods 与 Apple Music Dolby Atmos 播放中验证；本轮改动的结果和限制见 [`docs/REVIEW.md`](docs/REVIEW.md)。
+
+源码结构：`src/io/github/dcl/` 为独立后台及音效适配；`src/io/github/dcl/app/` 为原生界面、Root 客户端与 SoundAlive 钩子；`src/native/` 为固定表事务；`tests/` 为宿主回归；`tools/` 为构建和开发验收工具。
+
+项目自有源码使用 MIT 许可证，第三方权利见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。本项目与三星、Dolby、Apple 无隶属关系。
